@@ -1,0 +1,53 @@
+Creating a Linux VM Template in SCVMM
+Build, generalize, and validate a golden Linux VHDX for System Center Virtual Machine Manager
+Applies to VMM 2019 / 2022 / 2025  ·  Hyper-V  ·  Ubuntu, RHEL, SUSE and derivatives
+This procedure covers the full lifecycle: building the base VM, installing the VMM guest agent, stripping machine-unique state (Linux has no sysprep), publishing to the library, and validating that two simultaneous deployments come up genuinely distinct.
+1.  Build & Update
+Spin up your base Linux VM (Ubuntu, RHEL, SUSE, etc.) on Hyper-V. Update packages and confirm the kernel has current Hyper-V Linux Integration Services (LIS) modules — baked in natively on most modern distros.
+Decide Generation 1 vs Generation 2 now — the template inherits it and it cannot be changed later.
+Secure Boot:  If Gen 2, set the firmware's Secure Boot template to Microsoft UEFI Certificate Authority, or disable Secure Boot. The default "Microsoft Windows" template will not boot Linux — and it presents as a template that deploys fine and then hangs.
+2.  Install the VMM Guest Agent for Linux
+This is what allows SCVMM to inject OS configuration (hostname, root credentials, SSH keys) during deployment. Pull the installer from your VMM Server:
+C:\Program Files\Microsoft System Center\Virtual Machine Manager\agents\Linux
+On VMM 2016 the path is ...\Microsoft System Center 2016\Virtual Machine Manager\agents\Linux. Copy the agent files to the VM and run:
+chmod +x install
+./install scvmmguestagent.1.0.0.544.x64.tar
+Do not  leave the source VM's hostname set to localhost. Microsoft documents that the agent's cfghostdomain garbles /etc/hosts in that case.
+3.  Resolve Specialization Ownership
+Only one component may own hostname and network configuration on first boot. If the image ships cloud-init (Ubuntu cloud images, RHEL 9), it will race the VMM agent. Either remove the package or neutralize it:
+cloud-init clean --logs --seed
+systemctl disable cloud-init cloud-init-local cloud-config cloud-final
+4.  Scrub the Machine State
+There is no sysprep, so uniqueness must be stripped by hand before shutdown.
+# SSH identity
+rm -f /etc/ssh/ssh_host_*
+rm -f /root/.ssh/authorized_keys /root/.ssh/known_hosts
+ 
+# Machine ID -- truncate, do not delete
+truncate -s 0 /etc/machine-id
+rm -f /var/lib/dbus/machine-id
+ln -s /etc/machine-id /var/lib/dbus/machine-id
+ 
+# DHCP lease state
+rm -f /var/lib/dhclient/* /var/lib/dhcp/*
+rm -f /var/lib/NetworkManager/*.lease
+ 
+# Persistent network naming (older distros)
+rm -f /etc/udev/rules.d/70-persistent-net.rules
+ 
+# Logs and history
+truncate -s 0 /var/log/wtmp /var/log/btmp /var/log/lastlog
+rm -rf /var/log/journal/*
+rm -f /root/.bash_history
+rm -rf /tmp/* /var/tmp/*
+ 
+# Agent logs
+rm -f /var/opt/microsoft/scvmmagent/log/*
+Critical:  the machine-id step is the one most often skipped. Without it every VM off the template presents the same DHCP DUID / client-id, so they contend for a single lease. It surfaces as duplicate-IP chaos that looks like a network fault rather than a template defect. Truncate rather than delete — systemd reliably regenerates a zero-length file, but may not recreate a missing one.
+Also complete the following:
+•	Deregister the subscription identity — subscription-manager clean (RHEL), SUSEConnect --cleanup plus clearing /etc/zypp/credentials.d (SLES), or remove the Ubuntu Pro token. Otherwise every clone reports as the same registered host.
+•	Confirm /etc/fstab uses UUID or LABEL — never /dev/sdX.
+•	Set NICs back to DHCP and remove any NetworkManager profile carrying a fixed UUID or a cloned MAC.
+•	Reclaim free space so the VHDX compacts: fstrim -av, or zerofree on ext4. This matters on library storage once you keep several template versions.
+5.  Shut Down Cleanly
+shutdown -h now — a graceful shutdown, not a saved state. Delete every checkpoint first: a VHDX sitting on an .avhdx differencing chain cannot be templated.
